@@ -51,6 +51,8 @@ use serde::Serialize;
 use std::collections::HashMap;
 use failure::Fail;
 
+use std::time::{Duration, Instant};
+
 use sodiumoxide::crypto::generichash::State;
 
 pub type ContextKey = Vec<String>;
@@ -77,7 +79,7 @@ struct Commit {
     root_hash: EntryHash,
     time: u64,
     author: String,
-    message: String,
+    message: String ,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -505,6 +507,86 @@ impl MerkleStorage {
     fn key_to_string(&self, key: &ContextKey) -> String {
         key.clone().join("/")
     }
+    
+    fn string_to_key(&self, string: &String) -> ContextKey {
+        string.split('/').map(str::to_string).collect()
+    }
+
+    // recursion is risky (stack overflow) and inefficient, try to do it iteratively..
+    fn get_key_values_from_tree_recursively(&self, path: &String, entry: &Entry, mut entries: &mut Vec<(ContextKey, ContextValue)> ) -> Result<(), StorageError> {
+        println!("recur: path={:?}", path);
+        match entry {
+            Entry::Blob(blob) => {
+                // push key-value pair
+                println!("pushing key={:?}", path);
+                entries.push((self.string_to_key(path), blob.to_vec()));
+                Ok(())
+            }
+            Entry::Tree(tree) => {
+                // Go through all descendants and gather errors. Remap error if there is a failure
+                // anywhere in the recursion paths. TODO: is revert possible?
+                //
+//                tree.iter().map(|(key, child_node)| {
+//                    let fullpath = path.clone() + "/" + key;
+//                    match self.get_entry(&child_node.entry_hash) {
+//                        Err(_) => Ok(()),
+//                        Ok(entry) => {
+//                            println!("entry is Tree, recursing for entry: {:?}", entry);
+//                            self.get_key_values_from_tree_recursively(&fullpath, &entry, entries)
+//                        }
+//                    }
+//                }).find_map(|res| {
+//                    match res {
+//                        Ok(_) => None,
+//                        Err(err) => Some(Err(err)),
+//                    }
+//                }).unwrap_or(Ok(()))
+                println!("Tree has {} elements", tree.len());
+                for (key, child_node) in tree.iter() {
+                    let fullpath = path.clone() + "/" + key;
+                    let entry = self.get_entry(&child_node.entry_hash)?;
+                    println!("entry is Tree, recursing for entry: {:?}", entry);
+                    self.get_key_values_from_tree_recursively(&fullpath, &entry, &mut entries)?;
+                }
+                Ok(())
+            }
+            Entry::Commit(commit) => {
+                match self.get_entry(&commit.root_hash) {
+                    Err(err) => Err(err),
+                    Ok(entry) => self.get_key_values_from_tree_recursively(path, &entry, entries),
+                }
+            }
+        }
+    }
+
+    pub fn get_key_values_by_prefix(&self, context_hash: &EntryHash, prefix: &ContextKey) -> Result<Option<Vec<(ContextKey, ContextValue)>>, StorageError> {
+        let commit = self.get_commit(&context_hash)?;
+        let root_tree = self.get_tree(&commit.root_hash)?;
+        let prefixed_tree = self.find_tree(&root_tree, prefix)?;
+        let mut keyvalues: Vec<(ContextKey, ContextValue)> = Vec::new();
+
+        println!("prefixed tree has {} elements", prefixed_tree.len());
+        for (key, child_node) in prefixed_tree.iter() {
+            println!("key: {:?}", key);
+            let entry = self.get_entry(&child_node.entry_hash)?;
+            let delimiter: &str;
+            if prefix.len() == 0 {
+                delimiter = "";
+            } else {
+                delimiter = "/";
+            }
+            let fullpath = self.key_to_string(prefix) + delimiter + key;
+            self.get_key_values_from_tree_recursively(&fullpath, &entry, &mut keyvalues)?;
+        }
+
+        if keyvalues.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(keyvalues))
+        }
+    }
+
+
 }
 
 #[cfg(test)]
@@ -562,6 +644,58 @@ mod tests {
 
         assert_eq!([0xCA, 0x7B, 0xC7, 0x02], commit.unwrap()[0..4]);
         // full irmin hash: ca7bc7022ffbd35acc97f7defb00c486bb7f4d19a2d62790d5949775eb74f3c8
+    }
+
+    #[test]
+    fn test_get_by_prefix() {
+        let _db_sync = SYNC.lock().unwrap();
+        let mut storage = get_storage();
+        let _commit = storage.commit(
+            0, "Tezos".to_string(), "Genesis".to_string());
+
+        storage.set(vec!["data".to_string(),  "a".to_string(), "x".to_string()], vec![3,4]);
+        storage.set(vec!["data".to_string(),  "a".to_string() ], vec![1,2]);
+        storage.set(vec!["data".to_string(),  "a".to_string(), "x".to_string(), "y".to_string() ], vec![5,6]);
+        storage.set(vec!["data".to_string(),  "b".to_string(), "x".to_string(), "y".to_string() ], vec![7,8]);
+        storage.set(vec!["adata".to_string(),  "b".to_string(), "x".to_string(), "y".to_string() ], vec![9,10]);
+        //
+        //data-a[1,2]
+        //data-a-x[3,4]
+        //data-a-x-y[5,6]
+        //data-b-x-y[7,8]
+        //adata-b-x-y[9,10]
+        //
+        let commit = storage.commit(
+            0, "Tezos".to_string(), "".to_string());
+
+        let a = storage.get_key_values_by_prefix(&commit.as_ref().unwrap(), &vec!["data".to_string(), "a".to_string()]).unwrap().unwrap();
+        println!("a:");
+        for (k,v) in a.iter() {
+            println!("k:{:?}, v:{:?}", k, v);
+        }
+        let b = storage.get_key_values_by_prefix(&commit.as_ref().unwrap(), &vec!["adata".to_string(), "a".to_string()]);
+        if b.unwrap().is_some() {
+            println!("Fail: result for adata/a is non-zero");
+        }
+        let c = storage.get_key_values_by_prefix(&commit.as_ref().unwrap(), &vec!["adata".to_string(), "b".to_string()]).unwrap().unwrap();
+        println!("c:");
+        for (k,v) in c.iter() {
+            println!("k:{:?}, v:{:?}", k, v);
+        }
+        let d = storage.get_key_values_by_prefix(&commit.as_ref().unwrap(), &vec!["adata".to_string()]).unwrap().unwrap();
+        println!("d:");
+        for (k,v) in d.iter() {
+            println!("k:{:?}, v:{:?}", k, v);
+        }
+        let e = storage.get_key_values_by_prefix(&commit.as_ref().unwrap(), &vec!["data".to_string()]).unwrap().unwrap();
+        println!("e:");
+        for (k,v) in e.iter() {
+            println!("k:{:?}, v:{:?}", k, v);
+        }
+        let f = storage.get_key_values_by_prefix(&commit.as_ref().unwrap(), &vec![]);
+        if f.unwrap().is_some() {
+            println!("Fail: result for empty prefix is non-zero");
+        }
     }
 
     #[test]
@@ -769,4 +903,4 @@ mod tests {
 
         assert!(if let StorageError::DBError { .. } = res.err().unwrap() { true } else { false });
     }
-}
+    }
