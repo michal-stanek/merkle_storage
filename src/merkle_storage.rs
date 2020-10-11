@@ -50,10 +50,12 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
 use failure::Fail;
+use std::thread;
 
 use std::time::{Duration, Instant};
 
 use sodiumoxide::crypto::generichash::State;
+use rand;
 
 pub type ContextKey = Vec<String>;
 pub type ContextValue = Vec<u8>;
@@ -902,5 +904,48 @@ mod tests {
             0, "".to_string(), "".to_string());
 
         assert!(if let StorageError::DBError { .. } = res.err().unwrap() { true } else { false });
+    }
+
+    #[test]
+    fn test_primary() {
+        let _db_sync = SYNC.lock().unwrap();
+        //{ clean_db(); }
+
+        let db = DB::open(&Options::default(), "_merkle_db_test").unwrap();
+        let mut storage = MerkleStorage::new(db);
+
+        let mut cnt = rand::random();
+        loop {
+            storage.set(vec!["abababa".to_string()], vec![9u8]);
+            let res = storage.commit(
+                cnt, "".to_string(), "".to_string());
+
+            cnt += 1;
+            let ten_millis = Duration::from_millis(10);
+            thread::sleep(ten_millis);
+        }
+    }
+
+    #[test]
+    fn test_secondary() {
+        let _db_sync = SYNC.lock().unwrap();
+        //{ clean_db(); }
+
+        //test_multiple_commit_hash();
+        let db = DB::open_as_secondary(&Options::default(), "_merkle_db_test", "_merkle_db_test_secondary").unwrap();
+
+        let mut storage = MerkleStorage::new(db);
+        let mut oldcnt = 0;
+        loop {
+            storage.db.try_catch_up_with_primary().unwrap();
+            let mut cnt = 0;
+            storage.db.iterator(IteratorMode::Start).for_each(|(k, v)| {
+                cnt += 1;
+            });
+            if cnt != oldcnt {
+                oldcnt = cnt;
+                println!("cnt={}", cnt);
+            }
+        }
     }
     }
